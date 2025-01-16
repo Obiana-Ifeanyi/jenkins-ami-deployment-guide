@@ -1,0 +1,413 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  CloudFormation template to deploy a Jenkins Master instance in a private subnet, accessible via a public ALB.
+
+Mappings:
+  RegionMap:
+    us-east-1:
+      ImageId: ami-0d2f06de95dfc002b
+    us-west-1: 
+      ImageId: ami-xxxxxxxxxxxxxxxxx
+    us-east-2: 
+      ImageId: ami-xxxxxxxxxxxxxxxxx
+    us-west-2: 
+      ImageId: ami-xxxxxxxxxxxxxxxxx
+    ca-central-1: 
+      ImageId: ami-xxxxxxxxxxxxxxxxx
+    sa-east-1: 
+      ImageId: ami-xxxxxxxxxxxxxxxxx
+    eu-west-1: 
+      ImageId: ami-xxxxxxxxxxxxxxxxx
+    eu-west-2: 
+      ImageId: ami-xxxxxxxxxxxxxxxxx
+    eu-west-3: 
+      ImageId: ami-xxxxxxxxxxxxxxxxx
+    eu-central-1: 
+      ImageId: ami-xxxxxxxxxxxxxxxxx
+    eu-north-1: 
+      ImageId: ami-xxxxxxxxxxxxxxxxx
+    ap-south-1: 
+      ImageId: ami-xxxxxxxxxxxxxxxxx
+    ap-southeast-1: 
+      ImageId: ami-xxxxxxxxxxxxxxxxx
+    ap-southeast-2: 
+      ImageId: ami-xxxxxxxxxxxxxxxxx
+    ap-northeast-1: 
+      ImageId: ami-xxxxxxxxxxxxxxxxx
+    ap-northeast-2: 
+      ImageId: ami-xxxxxxxxxxxxxxxxx
+    ap-northeast-3: 
+      ImageId: ami-xxxxxxxxxxxxxxxxx
+
+Parameters:
+  InstanceType:
+    Type: String
+    Default: t2.micro
+    Description: EC2 instance type.
+    AllowedValues:
+      - t2.micro
+      - t2.small
+      - t2.medium
+      - t3.micro
+      - t3.small
+      - t3.medium
+    ConstraintDescription: The instance type must be a valid EC2 instance type for the selected region.
+  
+  NetworkPrefix:
+    Type: String
+    Description: >
+      A prefix to be used for naming all networking resources in the VPC (e.g., "myproject"). 
+      This prefix will be used to auto-generate Name tags for the VPC, subnets, route tables, 
+      internet gateway, and other related resources.
+    MinLength: 1
+    MaxLength: 128
+    AllowedPattern: "^[a-zA-Z0-9-]*$"
+    ConstraintDescription: "The prefix must be between 1 and 128 characters, and can only contain letters, numbers, and hyphens."
+
+  ALBName:
+    Type: String
+    Description: >
+      Name of the Application Load Balancer (ALB) to be created. 
+      This will be used to name the ALB and related resources such as listener and target group.
+    MinLength: 1
+    MaxLength: 128
+    AllowedPattern: "^[a-zA-Z0-9-]*$"
+    ConstraintDescription: "The ALB name must be between 1 and 128 characters, and can only contain letters, numbers, and hyphens."
+
+  ASGName:
+    Type: String
+    Description: >
+      Name of the Auto Scaling Group (ASG) to be created. 
+      This will be used to name the Auto Scaling Group and related resources such as launch template.
+    MinLength: 1
+    MaxLength: 128
+    AllowedPattern: "^[a-zA-Z0-9-]*$"
+    ConstraintDescription: "The ASG name must be between 1 and 128 characters, and can only contain letters, numbers, and hyphens."
+
+  KeyPairName:
+    Type: String
+    Description: Name of the EC2 Key Pair to be used for the instance
+
+Resources:
+  # Create a VPC
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: "10.0.0.0/16"
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${NetworkPrefix}-vpc"
+
+  # Create an Internet Gateway and attach it to the VPC
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub "${NetworkPrefix}-igw"
+
+  AttachInternetGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  # Create two public subnets in different Availability Zones (for ALB)
+  JenkinsPublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: "10.0.1.0/24"
+      AvailabilityZone: !Select [ 0, !GetAZs '' ]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${NetworkPrefix}-subnet-public1-${AWS::Region}"
+
+  JenkinsPublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: "10.0.2.0/24"
+      AvailabilityZone: !Select [ 1, !GetAZs '' ]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${NetworkPrefix}-subnet-public2-${AWS::Region}"
+
+  # Create two private subnets in different Availability Zones (for Jenkins EC2)
+  JenkinsPrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: "10.0.3.0/24"
+      AvailabilityZone: !Select [ 0, !GetAZs '' ]
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub "${NetworkPrefix}-subnet-private1-${AWS::Region}"
+
+  JenkinsPrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: "10.0.4.0/24"
+      AvailabilityZone: !Select [ 1, !GetAZs '' ]
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub "${NetworkPrefix}-subnet-private2-${AWS::Region}"
+
+  # Allocate Elastic IP for NAT Gateway
+  NATEIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+
+  # Create NAT Gateway in the first public subnet
+  NATGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      SubnetId: !Ref JenkinsPublicSubnet1  # Use one of the public subnets
+      AllocationId: !GetAtt NATEIP.AllocationId
+      Tags:
+        - Key: Name
+          Value: !Sub "${NetworkPrefix}-nat-igw"
+
+  # Create Route Table for the public subnets
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub "${NetworkPrefix}-rtb-public"
+
+  # Create a route for the Jenkins Public Subnets to access the Internet Gateway
+  PublicRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: "0.0.0.0/0"
+      GatewayId: !Ref InternetGateway
+
+  # Associate Public Route Table with Public Subnets
+  PublicRouteTableAssociation1:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref JenkinsPublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicRouteTableAssociation2:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref JenkinsPublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+
+  # Create a single Route Table for the private subnets
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub "${NetworkPrefix}-rtb-private"
+
+  # Create a route for private subnets to access the NAT Gateway
+  PrivateRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: "0.0.0.0/0"
+      NatGatewayId: !Ref NATGateway
+
+  # Associate Private Route Table with Private Subnets
+  PrivateRouteTableAssociation1:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref JenkinsPrivateSubnet1
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateRouteTableAssociation2:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref JenkinsPrivateSubnet2
+      RouteTableId: !Ref PrivateRouteTable
+
+  # Elastic IP for Jenkins Master
+  ElasticIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+
+  # Create a Security Group for Jenkins EC2 (allow traffic only from ALB)
+  JenkinsMasterSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: "Allow HTTP (8080) from ALB only"
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: '8080'
+          ToPort: '8080'
+          SourceSecurityGroupId: !Ref ALBSecurityGroup  # Allow only from the ALB security group
+
+  # Create a Security Group for ALB
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: "Security group for the ALB"
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: '80'
+          ToPort: '80'
+          CidrIp: 0.0.0.0/0  # Allow HTTP traffic from the internet
+        - IpProtocol: tcp
+          FromPort: '443'
+          ToPort: '443'
+          CidrIp: 0.0.0.0/0  # Allow HTTPS traffic from the internet
+
+  # Create an Application Load Balancer (ALB) in Public Subnets
+  ALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub "${ALBName}-ALB"
+      Subnets:
+        - Ref: JenkinsPublicSubnet1  # Attach public subnets for ALB
+        - Ref: JenkinsPublicSubnet2
+      SecurityGroups:
+        - Ref: ALBSecurityGroup
+      Scheme: internet-facing  # ALB is internet-facing
+      LoadBalancerAttributes:
+        - Key: idle_timeout.timeout_seconds
+          Value: '60'
+      Tags:
+        - Key: Name
+          Value: !Sub "${ALBName}-ALB"
+
+  # Create a Target Group for the ALB (for Jenkins EC2)
+  ALBTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub "${ALBName}-ALBTargetGroup"
+      Protocol: HTTP
+      Port: 8080
+      VpcId: !Ref VPC
+      HealthCheckProtocol: HTTP
+      HealthCheckPort: "8080"
+      HealthCheckPath: "/login"
+      Matcher:
+        HttpCode: 200
+      TargetType: instance
+
+  # Create an HTTP Listener for the ALB
+  ALBHttpListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: "forward"
+          TargetGroupArn: !Ref ALBTargetGroup
+      LoadBalancerArn: !Ref ALB
+      Port: 80
+      Protocol: HTTP
+
+  # Launch Template for Jenkins Master EC2 (private subnet)
+  JenkinsMasterLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub "launchtemplate-${AWS::StackName}"
+      VersionDescription: "v1"
+      LaunchTemplateData:
+        ImageId: 
+          Fn::FindInMap: 
+            - RegionMap
+            - !Ref "AWS::Region"
+            - ImageId
+        InstanceType: !Ref InstanceType
+        KeyName: !Ref KeyPairName
+        SecurityGroupIds:
+          - !Ref JenkinsMasterSecurityGroup
+        IamInstanceProfile:
+          Arn: !GetAtt JenkinsMasterInstanceProfile.Arn
+
+  # Auto Scaling Group for Jenkins Master EC2
+  JenkinsMasterAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      MinSize: "1"
+      MaxSize: "1"
+      DesiredCapacity: "1"
+      LaunchTemplate:
+        LaunchTemplateName: !Sub "launchtemplate-${AWS::StackName}"
+        Version: !GetAtt JenkinsMasterLaunchTemplate.LatestVersionNumber
+      VPCZoneIdentifier:
+        - Ref: JenkinsPrivateSubnet1  # Private subnets for Jenkins EC2
+        - Ref: JenkinsPrivateSubnet2
+      TargetGroupARNs:
+        - Ref: ALBTargetGroup
+      HealthCheckType: EC2
+      HealthCheckGracePeriod: 300
+      Tags:
+        - Key: Name
+          Value: !Sub "JenkinsMaster-${AWS::StackName}"
+          PropagateAtLaunch: true
+
+  # IAM Role for Jenkins EC2
+  JenkinsMasterIAMRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "JenkinsMasterRole-${AWS::StackName}-${AWS::Region}"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: 'Allow'
+            Principal:
+              Service: 'ec2.amazonaws.com'
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: !Sub "JenkinsMasterEC2Policy-${AWS::StackName}-${AWS::Region}"
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Action:
+                  - "ec2:DescribeSpotInstanceRequests"
+                  - "ec2:CancelSpotInstanceRequests"
+                  - "ec2:GetConsoleOutput"
+                  - "ec2:RequestSpotInstances"
+                  - "ec2:RunInstances"
+                  - "ec2:StartInstances"
+                  - "ec2:StopInstances"
+                  - "ec2:TerminateInstances"
+                  - "ec2:CreateTags"
+                  - "ec2:DeleteTags"
+                  - "ec2:DescribeInstances"
+                  - "ec2:DescribeInstanceTypes"
+                  - "ec2:DescribeKeyPairs"
+                  - "ec2:DescribeRegions"
+                  - "ec2:DescribeImages"
+                  - "ec2:DescribeAvailabilityZones"
+                  - "ec2:DescribeSecurityGroups"
+                  - "ec2:DescribeSubnets"
+                  - "iam:ListInstanceProfilesForRole"
+                  - "iam:PassRole"
+                  - "ec2:GetPasswordData"
+                Effect: 'Allow'
+                Resource: '*'
+
+  # IAM Instance Profile for Jenkins EC2
+  JenkinsMasterInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - Ref: JenkinsMasterIAMRole
+
+Outputs:
+  InstanceId:
+    Description: "Instance ID of the Jenkins Master"
+    Value: !Ref JenkinsMasterAutoScalingGroup
+  JenkinsURL:
+    Description: "URL for Jenkins"
+    Value: !Sub "http://${ALB.DNSName}"
